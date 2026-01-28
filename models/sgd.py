@@ -19,6 +19,7 @@ class Sgd(ContinualModel):
     COMPATIBILITY = ['class-il', 'domain-il', 'task-il', 'general-continual']
 
     def __init__(self, backbone, loss, args, transform, dataset=None):
+        print("Test 0: model -> sgd : ok")
         super(Sgd, self).__init__(backbone, loss, args, transform, dataset=dataset)
 
     def observe(self, inputs, labels, not_aug_inputs, epoch=None, **kwargs):
