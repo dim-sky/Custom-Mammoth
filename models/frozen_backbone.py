@@ -68,10 +68,6 @@ class FrozenBackbone(ContinualModel):
         
         
     @staticmethod
-    def get_parser():
-        parser = ArgumentParser(description='Frozen Backbone with Linear Head')
-        add_management_args(parser)
-        add_experiment_args(parser)
+    def get_parser(parser):
+        # Τα standard args (seed, lr, κλπ) προστίθενται από το main.py
         return parser
-
-
