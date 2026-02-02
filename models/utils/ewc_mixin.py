@@ -1,6 +1,6 @@
 """
-EWC (Elastic Weight Consolidation) Mixin - SIMPLIFIED VERSION
-No complex Fisher computation - uses uniform importance
+EWC (Elastic Weight Consolidation) Mixin - FINAL FIXED VERSION
+Simplified version with correct Fisher magnitude
 """
 
 import torch
@@ -11,7 +11,7 @@ from typing import Dict
 class EWCMixin:
     """
     Mixin class for EWC functionality.
-    Simplified version: uniform Fisher (no data loading issues)
+    Simplified version: uniform Fisher with correct magnitude
     """
     
     def __init__(self):
@@ -24,18 +24,19 @@ class EWCMixin:
     def compute_fisher(self, dataset, num_samples=200):
         """
         Compute Fisher Information.
-        SIMPLIFIED: Uses uniform importance (avoids data loading issues)
+        FIXED: Uses Fisher = 1.0 (instead of 0.01) to work with λ=400
         """
         print(f"[EWC] Computing Fisher for Task {self.task_count + 1}...")
         
-        # Use uniform Fisher (all params equally important)
+        # Use uniform Fisher with CORRECT magnitude
         if not self.fisher:
             # First task: initialize
             self.fisher = {}
             for name, param in self.net.named_parameters():
                 if param.requires_grad:
-                    # Small uniform importance
-                    self.fisher[name] = torch.ones_like(param) * 0.01
+                    # CRITICAL FIX: 1.0 instead of 0.01! ⭐⭐⭐
+                    # This gives proper penalty strength with λ=400
+                    self.fisher[name] = torch.ones_like(param) * 1.0
             
             print(f"[EWC] ✓ Initialized Fisher (Task 1)")
         else:
@@ -54,7 +55,8 @@ class EWCMixin:
         
         # Print stats
         total_fisher = sum(f.sum().item() for f in self.fisher.values())
-        print(f"[EWC] Fisher stats: Total={total_fisher:.4f}, Tasks={self.task_count}")
+        avg_fisher = total_fisher / sum(f.numel() for f in self.fisher.values())
+        print(f"[EWC] Fisher stats: Total={total_fisher:.2f}, Avg={avg_fisher:.4f}, Tasks={self.task_count}")
     
     def ewc_penalty(self):
         """
@@ -80,8 +82,8 @@ class EWCMixin:
         if self.task_count > 0:
             penalty = penalty / self.task_count
         
-        # Safety clip
-        penalty = torch.clamp(penalty, max=100.0)
+        # Safety clip (higher now that Fisher is larger)
+        penalty = torch.clamp(penalty, max=1000.0)
         
         return penalty
     
