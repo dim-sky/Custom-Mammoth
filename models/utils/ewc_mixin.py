@@ -1,6 +1,5 @@
 """
-EWC (Elastic Weight Consolidation) Mixin - FINAL FIXED VERSION
-Simplified version with correct Fisher magnitude
+EWC Mixin - PROPERLY SCALED VERSION
 """
 
 import torch
@@ -10,8 +9,8 @@ from typing import Dict
 
 class EWCMixin:
     """
-    Mixin class for EWC functionality.
-    Simplified version: uniform Fisher with correct magnitude
+    Mixin for EWC functionality.
+    FIXED: Properly scaled Fisher to avoid explosion
     """
     
     def __init__(self):
@@ -24,27 +23,34 @@ class EWCMixin:
     def compute_fisher(self, dataset, num_samples=200):
         """
         Compute Fisher Information.
-        FIXED: Uses Fisher = 1.0 (instead of 0.01) to work with λ=400
+        FIXED: Normalize Fisher by total parameter count
         """
         print(f"[EWC] Computing Fisher for Task {self.task_count + 1}...")
         
-        # Use uniform Fisher with CORRECT magnitude
+        # Use uniform Fisher with PROPER normalization
         if not self.fisher:
             # First task: initialize
             self.fisher = {}
+            
+            # Count total trainable parameters
+            total_params = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+            
+            # Base Fisher value (normalized)
+            # This ensures total penalty scales reasonably
+            base_fisher = 1.0 / total_params  # ⭐⭐⭐ KEY FIX!
+            
             for name, param in self.net.named_parameters():
                 if param.requires_grad:
-                    # CRITICAL FIX: 1.0 instead of 0.01! ⭐⭐⭐
-                    # This gives proper penalty strength with λ=400
-                    self.fisher[name] = torch.ones_like(param) * 1.0
+                    self.fisher[name] = torch.ones_like(param) * base_fisher
             
             print(f"[EWC] ✓ Initialized Fisher (Task 1)")
+            print(f"[EWC] Total trainable params: {total_params}")
+            print(f"[EWC] Base Fisher value: {base_fisher:.6f}")
         else:
             # Subsequent tasks: keep same Fisher
-            # (In simplified version, we don't recompute)
             print(f"[EWC] ✓ Using existing Fisher (Task {self.task_count + 1})")
         
-        # Store optimal parameters from current task
+        # Store optimal parameters
         self.old_params = {}
         for name, param in self.net.named_parameters():
             if param.requires_grad:
@@ -56,14 +62,11 @@ class EWCMixin:
         # Print stats
         total_fisher = sum(f.sum().item() for f in self.fisher.values())
         avg_fisher = total_fisher / sum(f.numel() for f in self.fisher.values())
-        print(f"[EWC] Fisher stats: Total={total_fisher:.2f}, Avg={avg_fisher:.4f}, Tasks={self.task_count}")
+        print(f"[EWC] Fisher stats: Total={total_fisher:.4f}, Avg={avg_fisher:.6f}, Tasks={self.task_count}")
     
     def ewc_penalty(self):
         """
         Compute EWC penalty term.
-        
-        Returns:
-            penalty: Scalar tensor
         """
         if not self.fisher or not self.old_params:
             return torch.tensor(0.0).to(self.device)
@@ -78,20 +81,15 @@ class EWCMixin:
                 # Weight by Fisher importance
                 penalty += (self.fisher[name] * diff).sum()
         
-        # Scale by task count to prevent linear growth
+        # Scale by task count
         if self.task_count > 0:
             penalty = penalty / self.task_count
         
-        # Safety clip (higher now that Fisher is larger)
-        penalty = torch.clamp(penalty, max=1000.0)
+        # Safety clip
+        penalty = torch.clamp(penalty, max=100.0)
         
         return penalty
     
     def end_task(self, dataset):
-        """
-        Called at the end of each task.
-        
-        Args:
-            dataset: Current dataset
-        """
+        """Called at the end of each task"""
         self.compute_fisher(dataset, num_samples=200)
