@@ -1,5 +1,5 @@
 """
-EWC (Elastic Weight Consolidation) Mixin - FIXED VERSION
+EWC Mixin - FIXED VERSION (Stable Training)
 """
 
 import torch
@@ -10,6 +10,7 @@ from typing import Dict
 class EWCMixin:
     """
     Mixin class που προσθέτει EWC functionality.
+    FIXED: Prevents NaN/inf loss με Fisher clipping & normalization.
     """
     
     def __init__(self):
@@ -21,8 +22,7 @@ class EWCMixin:
     def compute_fisher(self, dataset, num_samples=1000):
         """
         Υπολογίζει Fisher Information Matrix.
-        
-        FIXED: Works με Mammoth datasets που δεν έχουν __len__
+        FIXED: Adds stability measures (clipping, normalization).
         """
         print(f"[EWC] Computing Fisher Information Matrix...")
         
@@ -35,18 +35,13 @@ class EWCMixin:
         # Set model to eval
         self.net.eval()
         
-        # ========== FIX: Use Mammoth's train_loader ==========
-        # Mammoth datasets έχουν custom interface
-        # Χρησιμοποιούμε το train_loader από το dataset
-        
         # Get current task data
         train_dataset = dataset.get_data_loaders()[0].dataset
         
-        # Create loader manually
+        # Create loader
         from torch.utils.data import DataLoader, Subset
         import numpy as np
         
-        # Sample indices (if dataset too large)
         if hasattr(train_dataset, '__len__'):
             total_size = len(train_dataset)
             if total_size > num_samples:
@@ -55,14 +50,13 @@ class EWCMixin:
             else:
                 sampled_dataset = train_dataset
         else:
-            # Fallback: just use full dataset
             sampled_dataset = train_dataset
         
         loader = DataLoader(
             sampled_dataset,
             batch_size=32,
             shuffle=True,
-            num_workers=0  # Important για stability
+            num_workers=0
         )
         
         # Accumulate gradients
@@ -71,7 +65,7 @@ class EWCMixin:
             if samples_seen >= num_samples:
                 break
             
-            # Unpack batch (Mammoth format)
+            # Unpack batch
             if len(batch_data) == 3:
                 inputs, labels, _ = batch_data
             else:
@@ -82,8 +76,6 @@ class EWCMixin:
             
             # Forward pass
             outputs = self.net(inputs)
-            
-            # Compute loss
             loss = nn.functional.cross_entropy(outputs, labels)
             
             # Backward
@@ -97,13 +89,27 @@ class EWCMixin:
             
             samples_seen += inputs.size(0)
             
-            # Progress
             if (batch_idx + 1) % 10 == 0:
                 print(f"[EWC] Processed {samples_seen}/{num_samples} samples")
         
-        # Normalize
+        # ========== CRITICAL FIX: Normalize & Clip Fisher ==========
+        
+        # Normalize by number of samples
         for name in self.fisher:
-            self.fisher[name] /= max(samples_seen, 1)  # Avoid division by 0
+            self.fisher[name] /= max(samples_seen, 1)
+        
+        # Clip extreme values (prevent explosion)
+        max_fisher = 100.0  # Reasonable upper bound
+        for name in self.fisher:
+            self.fisher[name] = torch.clamp(self.fisher[name], max=max_fisher)
+        
+        # Optional: Normalize to [0, 1] range
+        for name in self.fisher:
+            fisher_max = self.fisher[name].max()
+            if fisher_max > 0:
+                self.fisher[name] = self.fisher[name] / fisher_max
+        
+        # ==========================================================
         
         # Store optimal parameters
         self.old_params = {}
@@ -111,7 +117,11 @@ class EWCMixin:
             if param.requires_grad:
                 self.old_params[name] = param.data.clone()
         
+        # Debug: Print Fisher statistics
+        total_fisher = sum(f.sum().item() for f in self.fisher.values())
+        avg_fisher = total_fisher / sum(f.numel() for f in self.fisher.values())
         print(f"[EWC] ✓ Fisher computed on {samples_seen} samples")
+        print(f"[EWC] Fisher stats: Total={total_fisher:.2f}, Avg={avg_fisher:.6f}")
         
         # Back to train
         self.net.train()
@@ -119,6 +129,7 @@ class EWCMixin:
     def ewc_penalty(self):
         """
         Υπολογίζει το EWC penalty term.
+        FIXED: Returns reasonable values (no explosion).
         """
         if not self.fisher:
             return torch.tensor(0.0).to(self.device)
@@ -127,8 +138,16 @@ class EWCMixin:
         
         for name, param in self.net.named_parameters():
             if name in self.fisher:
+                # Compute difference
                 diff = (param - self.old_params[name]).pow(2)
+                
+                # Weighted by normalized Fisher
                 penalty += (self.fisher[name] * diff).sum()
+        
+        # ========== CRITICAL FIX: Clip penalty ==========
+        # Prevent extreme values
+        penalty = torch.clamp(penalty, max=1000.0)
+        # =================================================
         
         return penalty
     
@@ -136,5 +155,4 @@ class EWCMixin:
         """
         Καλείται στο τέλος κάθε task.
         """
-        # Compute Fisher for current task
         self.compute_fisher(dataset, num_samples=1000)
