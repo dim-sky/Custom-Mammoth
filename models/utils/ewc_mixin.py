@@ -1,5 +1,5 @@
 """
-EWC Mixin - FIXED VERSION (Stable Training)
+EWC Mixin - FIXED VERSION (Online EWC με Proper Accumulation)
 """
 
 import torch
@@ -10,66 +10,60 @@ from typing import Dict
 class EWCMixin:
     """
     Mixin class που προσθέτει EWC functionality.
-    FIXED: Prevents NaN/inf loss με Fisher clipping & normalization.
+    FIXED: Proper Fisher accumulation (Online EWC)
     """
     
     def __init__(self):
         """Initialize EWC-specific attributes"""
-        self.fisher: Dict[str, torch.Tensor] = {}
+        self.fisher: Dict[str, torch.Tensor] = {}  # Accumulated Fisher
         self.old_params: Dict[str, torch.Tensor] = {}
         self.ewc_lambda = 0.0
+        self.task_count = 0  # Track number of tasks
     
-    def compute_fisher(self, dataset, num_samples=1000):
+    def compute_fisher(self, dataset, num_samples=200):
         """
-        Υπολογίζει Fisher Information Matrix.
-        FIXED: Adds stability measures (clipping, normalization).
-        """
-        print(f"[EWC] Computing Fisher Information Matrix...")
+        Υπολογίζει Fisher για CURRENT task και τον ACCUMULATES.
         
-        # Initialize Fisher dict
-        self.fisher = {}
+        FIXED: Uses Online EWC - accumulates Fisher across tasks
+        """
+        print(f"[EWC] Computing Fisher for Task {self.task_count + 1}...")
+        
+        # ========== STEP 1: Compute NEW Fisher για current task ==========
+        new_fisher = {}
         for name, param in self.net.named_parameters():
             if param.requires_grad:
-                self.fisher[name] = torch.zeros_like(param)
+                new_fisher[name] = torch.zeros_like(param)
         
         # Set model to eval
         self.net.eval()
         
-        # Get current task data
-        train_dataset = dataset.get_data_loaders()[0].dataset
+        # ========== Get current task data ==========
+        try:
+            train_loader = dataset.get_data_loaders()[0]
+        except (IndexError, ValueError) as e:
+            print(f"[EWC] Warning: Could not get data loader: {e}")
+            print(f"[EWC] Skipping Fisher computation for this task")
+            self.task_count += 1
+            return
         
-        # Create loader
-        from torch.utils.data import DataLoader, Subset
-        import numpy as np
-        
-        if hasattr(train_dataset, '__len__'):
-            total_size = len(train_dataset)
-            if total_size > num_samples:
-                indices = np.random.choice(total_size, num_samples, replace=False)
-                sampled_dataset = Subset(train_dataset, indices)
-            else:
-                sampled_dataset = train_dataset
-        else:
-            sampled_dataset = train_dataset
-        
-        loader = DataLoader(
-            sampled_dataset,
-            batch_size=32,
-            shuffle=True,
-            num_workers=0
-        )
-        
-        # Accumulate gradients
+        # Sample data
         samples_seen = 0
-        for batch_idx, batch_data in enumerate(loader):
-            if samples_seen >= num_samples:
+        batch_count = 0
+        max_batches = max(1, num_samples // 32)  # Limit batches
+        
+        for batch_idx, batch_data in enumerate(train_loader):
+            if batch_idx >= max_batches:
                 break
             
             # Unpack batch
-            if len(batch_data) == 3:
-                inputs, labels, _ = batch_data
-            else:
-                inputs, labels = batch_data[:2]
+            try:
+                if len(batch_data) == 3:
+                    inputs, labels, _ = batch_data
+                else:
+                    inputs, labels = batch_data[:2]
+            except (ValueError, TypeError):
+                print(f"[EWC] Warning: Could not unpack batch, skipping")
+                continue
             
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
@@ -85,51 +79,67 @@ class EWCMixin:
             # Accumulate squared gradients
             for name, param in self.net.named_parameters():
                 if param.requires_grad and param.grad is not None:
-                    self.fisher[name] += param.grad.pow(2) * inputs.size(0)
+                    new_fisher[name] += param.grad.pow(2) * inputs.size(0)
             
             samples_seen += inputs.size(0)
+            batch_count += 1
+        
+        if samples_seen == 0:
+            print(f"[EWC] Warning: No samples processed, skipping Fisher")
+            self.task_count += 1
+            return
+        
+        # Normalize NEW Fisher
+        for name in new_fisher:
+            new_fisher[name] /= samples_seen
+        
+        # ========== CRITICAL FIX: Clip & Normalize NEW Fisher ==========
+        max_fisher = 10.0  # Lower threshold (was 100)
+        for name in new_fisher:
+            # Clip extreme values
+            new_fisher[name] = torch.clamp(new_fisher[name], max=max_fisher)
             
-            if (batch_idx + 1) % 10 == 0:
-                print(f"[EWC] Processed {samples_seen}/{num_samples} samples")
+            # Normalize to [0, 1]
+            fisher_max = new_fisher[name].max()
+            if fisher_max > 1e-8:  # Avoid division by near-zero
+                new_fisher[name] = new_fisher[name] / fisher_max
         
-        # ========== CRITICAL FIX: Normalize & Clip Fisher ==========
+        # ========== STEP 2: ACCUMULATE Fisher (Online EWC) ==========
+        if not self.fisher:  # First task
+            # Initialize Fisher
+            self.fisher = new_fisher
+            print(f"[EWC] ✓ Initialized Fisher (Task 1)")
+        else:  # Subsequent tasks
+            # AVERAGE Fisher across tasks (not sum!)
+            # This prevents explosion
+            alpha = 1.0 / (self.task_count + 1)  # Weight for new task
+            
+            for name in self.fisher:
+                # Weighted average: old Fisher * (1-α) + new Fisher * α
+                self.fisher[name] = (1 - alpha) * self.fisher[name] + alpha * new_fisher[name]
+            
+            print(f"[EWC] ✓ Accumulated Fisher (Task {self.task_count + 1})")
         
-        # Normalize by number of samples
-        for name in self.fisher:
-            self.fisher[name] /= max(samples_seen, 1)
-        
-        # Clip extreme values (prevent explosion)
-        max_fisher = 100.0  # Reasonable upper bound
-        for name in self.fisher:
-            self.fisher[name] = torch.clamp(self.fisher[name], max=max_fisher)
-        
-        # Optional: Normalize to [0, 1] range
-        for name in self.fisher:
-            fisher_max = self.fisher[name].max()
-            if fisher_max > 0:
-                self.fisher[name] = self.fisher[name] / fisher_max
-        
-        # ==========================================================
-        
-        # Store optimal parameters
+        # ========== STEP 3: Store optimal parameters ==========
         self.old_params = {}
         for name, param in self.net.named_parameters():
             if param.requires_grad:
                 self.old_params[name] = param.data.clone()
         
-        # Debug: Print Fisher statistics
+        # Debug: Print stats
         total_fisher = sum(f.sum().item() for f in self.fisher.values())
-        avg_fisher = total_fisher / sum(f.numel() for f in self.fisher.values())
-        print(f"[EWC] ✓ Fisher computed on {samples_seen} samples")
-        print(f"[EWC] Fisher stats: Total={total_fisher:.2f}, Avg={avg_fisher:.6f}")
+        print(f"[EWC] Fisher stats: Total={total_fisher:.4f}, Tasks={self.task_count + 1}")
+        
+        # Increment task counter
+        self.task_count += 1
         
         # Back to train
         self.net.train()
     
     def ewc_penalty(self):
         """
-        Υπολογίζει το EWC penalty term.
-        FIXED: Returns reasonable values (no explosion).
+        Υπολογίζει το EWC penalty.
+        FIXED: Uses accumulated Fisher
         """
         if not self.fisher:
             return torch.tensor(0.0).to(self.device)
@@ -138,21 +148,19 @@ class EWCMixin:
         
         for name, param in self.net.named_parameters():
             if name in self.fisher:
-                # Compute difference
                 diff = (param - self.old_params[name]).pow(2)
-                
-                # Weighted by normalized Fisher
                 penalty += (self.fisher[name] * diff).sum()
         
-        # ========== CRITICAL FIX: Clip penalty ==========
-        # Prevent extreme values
-        penalty = torch.clamp(penalty, max=1000.0)
-        # =================================================
+        # ========== CRITICAL: Scale penalty by task count ==========
+        # Prevents linear growth as tasks increase
+        if self.task_count > 0:
+            penalty = penalty / self.task_count
+        
+        # Final safety clip
+        penalty = torch.clamp(penalty, max=100.0)
         
         return penalty
     
     def end_task(self, dataset):
-        """
-        Καλείται στο τέλος κάθε task.
-        """
-        self.compute_fisher(dataset, num_samples=1000)
+        """Called after each task"""
+        self.compute_fisher(dataset, num_samples=200)
