@@ -17,7 +17,15 @@ class LinearMAS(ContinualModel, MASMixin):
     def __init__(self, backbone: torch.nn.Module, loss: torch.nn.Module,
                  args: Namespace, transform: torch.nn.Module, dataset: ContinualDataset):
         
+        # Initialize ContinualModel
         super().__init__(backbone, loss, args, transform, dataset)
+        
+        # Explicitly initialize MAS attributes
+        self.omega = {}
+        self.old_params = {}
+        self.task_count = 0
+        
+        # Set MAS lambda
         self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 1.0
         
         print(f"\n[LinearMAS] MAS regularization enabled")
