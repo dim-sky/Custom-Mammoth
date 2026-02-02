@@ -1,5 +1,5 @@
 """
-MAS (Memory Aware Synapses) Mixin - FIXED SIGNATURE
+MAS (Memory Aware Synapses) Mixin - COMPLETE VERSION
 """
 
 import torch
@@ -10,26 +10,14 @@ from typing import Dict
 class MASMixin:
     """
     Mixin for MAS functionality.
-    FIXED: Proper __init__ signature for multiple inheritance
     """
     
-    def __init__(self, *args, **kwargs):  # ← ACCEPT ANY ARGUMENTS!
-        """
-        Initialize MAS attributes.
-        
-        NOTE: This is a mixin, so we accept *args, **kwargs
-        and pass them to the next class in MRO
-        """
-        # Call next class in MRO (ContinualModel)
-        # Only if this is being used in multiple inheritance
+    def __init__(self, *args, **kwargs):
+        """Initialize MAS attributes"""
+        # Note: This is handled in the model __init__ now
+        # We keep this for compatibility
         if hasattr(super(), '__init__'):
             super().__init__(*args, **kwargs)
-        
-        # Initialize MAS-specific attributes
-        self.omega: Dict[str, torch.Tensor] = {}
-        self.old_params: Dict[str, torch.Tensor] = {}
-        self.mas_lambda = 0.0
-        self.task_count = 0
     
     def compute_omega(self, dataset, num_samples=200):
         """
@@ -92,3 +80,15 @@ class MASMixin:
         # Scale by task count to prevent linear growth
         if self.task_count > 0:
             penalty = penalty / self.task_count
+        
+        # Safety clip
+        penalty = torch.clamp(penalty, max=100.0)
+        
+        return penalty
+    
+    def end_task(self, dataset):
+        """
+        Called at the end of each task.
+        Computes Omega (parameter importance).
+        """
+        self.compute_omega(dataset, num_samples=200)
