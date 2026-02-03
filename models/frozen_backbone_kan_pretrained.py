@@ -1,102 +1,112 @@
 """
-Frozen Backbone με ImageNet Pre-trained Weights + FastKAN Classifier
-WORKING VERSION - Correct FastKAN API
+KAN Classifier with MAS - Frozen Backbone
 """
 
 import torch
-import torch.nn as nn
-from argparse import ArgumentParser
+from models.utils.continual_model import ContinualModel
+from models.utils.mas_mixin import MASMixin
+from datasets.utils.continual_dataset import ContinualDataset
+from argparse import Namespace
 
-from models.frozen_backbone_pretrained import FrozenBackbonePretrained
-from models import register_model
 
-
-@register_model('frozen_backbone_kan_pretrained')
-class FrozenBackboneKANPretrained(FrozenBackbonePretrained):
-    """Frozen Backbone + FastKAN Classifier"""
-    NAME = 'frozen_backbone_kan_pretrained'
+class KANMAS(ContinualModel, MASMixin):
+    """KAN classifier with MAS regularization and frozen backbone"""
+    NAME = 'frozen_backbone_kan_mas_pretrained'
     COMPATIBILITY = ['class-il', 'task-il']
     
-    def __init__(self, backbone, loss, args, transform, dataset):
-        # Parent init (frozen backbone + ImageNet weights)
+    def __init__(self, backbone: torch.nn.Module, loss: torch.nn.Module,
+                 args: Namespace, transform: torch.nn.Module, dataset: ContinualDataset):
+        
         super().__init__(backbone, loss, args, transform, dataset)
         
-        # Replace Linear with FastKAN
-        print("[FrozenBackboneKAN] Replacing Linear classifier with FastKAN...")
-        self._replace_with_kan_classifier()
-        print(f"[FrozenBackboneKAN] ✓ FastKAN classifier installed!")
+        self._freeze_backbone()
+        self._verify_frozen()
+        self._print_trainable_summary()
         
-        self._print_trainable_params()
+        self.omega = {}
+        self.old_params = {}
+        self.task_count = 0
+        
+        self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 1.0
+        
+        print(f"\n{'='*70}")
+        print(f"[KANMAS] MAS regularization enabled")
+        print(f"[KANMAS] Lambda: {self.mas_lambda}")
+        print(f"{'='*70}\n")
     
-    def _replace_with_kan_classifier(self):
-        """Replace Linear classifier with FastKAN"""
+    def _freeze_backbone(self):
+        print("\n" + "="*70)
+        print("[FREEZE] Freezing backbone parameters...")
+        print("="*70)
         
-        # Import FastKAN
-        try:
-            from fastkan import FastKAN
-            print("[FrozenBackboneKAN] ✓ FastKAN library found")
-        except ImportError:
-            print("[ERROR] FastKAN not installed!")
-            print("[ERROR] Run: pip install fastkan")
-            raise
+        frozen_count = 0
+        trainable_count = 0
         
-        # Get feature dimension
-        if hasattr(self.net, 'num_features'):
-            feat_dim = self.net.num_features
-        elif hasattr(self.net.classifier, 'in_features'):
-            feat_dim = self.net.classifier.in_features
-        else:
-            feat_dim = 512
+        for name, param in self.net.named_parameters():
+            if 'classifier' not in name:
+                param.requires_grad = False
+                frozen_count += param.numel()
+            else:
+                param.requires_grad = True
+                trainable_count += param.numel()
         
-        # Get KAN hyperparameters
-        kan_hidden_dim = getattr(self.args, 'kan_hidden_dim', 64)
-        num_grids = getattr(self.args, 'kan_num_grids', 8)  # Correct parameter name!
-        grid_min = getattr(self.args, 'kan_grid_min', -2.0)
-        grid_max = getattr(self.args, 'kan_grid_max', 2.0)
-        
-        print(f"[FrozenBackboneKAN] KAN architecture:")
-        print(f"  Input dimension:  {feat_dim}")
-        print(f"  Hidden dimension: {kan_hidden_dim}")
-        print(f"  Output dimension: {self.num_classes}")
-        print(f"  Num grids:        {num_grids}")
-        print(f"  Grid range:       [{grid_min}, {grid_max}]")
-        
-        # Create FastKAN with correct API
-        layer_dims = [feat_dim, kan_hidden_dim, self.num_classes]
-        
-        self.net.classifier = FastKAN(
-            layers_hidden=layer_dims,  # [512, 64, 10]
-            grid_min=grid_min,          # -2.0
-            grid_max=grid_max,          # 2.0
-            num_grids=num_grids,        # 8 (not grid_size!)
-            use_base_update=True,       # Default
-            spline_weight_init_scale=0.1  # Default
-        )
-        
-        # Unfreeze KAN parameters
-        for param in self.net.classifier.parameters():
-            param.requires_grad = True
-        
-        print(f"[FrozenBackboneKAN] ✓ FastKAN created successfully")
+        print(f"[FREEZE] ✓ Frozen parameters: {frozen_count:,}")
+        print(f"[FREEZE] ✓ Trainable parameters: {trainable_count:,}")
+        print("="*70 + "\n")
     
-    def _print_trainable_params(self):
-        """Print parameter statistics"""
-        trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+    def _verify_frozen(self):
         total = sum(p.numel() for p in self.net.parameters())
-        percentage = 100.0 * trainable / total
+        trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+        frozen = total - trainable
         
-        print(f"[FrozenBackboneKAN] Parameter Statistics:")
-        print(f"  Trainable: {trainable:,} ({percentage:.2f}%)")
-        print(f"  Total:     {total:,}")
+        print("\n" + "="*70)
+        print("[VERIFY] Checking freeze status...")
+        print("="*70)
+        print(f"[VERIFY] Total parameters: {total:,}")
+        print(f"[VERIFY] Trainable parameters: {trainable:,}")
+        print(f"[VERIFY] Frozen parameters: {frozen:,}")
+        print(f"[VERIFY] Percentage frozen: {100 * frozen / total:.2f}%")
         
-        if percentage < 5.0:
-            print(f"  ✓ Backbone properly frozen")
+        if trainable > 200000:
+            print(f"[VERIFY] ❌ ERROR: Too many trainable parameters!")
         else:
-            print(f"  ⚠️ Too many trainable params")
+            print(f"[VERIFY] ✓ SUCCESS: Backbone is properly frozen")
+        print("="*70 + "\n")
+    
+    def _print_trainable_summary(self):
+        print("\n" + "="*70)
+        print("[SUMMARY] Trainable Layers:")
+        print("="*70)
+        
+        for name, param in self.net.named_parameters():
+            if param.requires_grad:
+                print(f"[SUMMARY]   ✓ {name}: {param.numel():,} params")
+        
+        print("="*70 + "\n")
+    
+    def observe(self, inputs, labels, not_aug_inputs, epoch=None):
+        self.opt.zero_grad()
+        
+        outputs = self.net(inputs)
+        ce_loss = self.loss(outputs, labels)
+        mas_loss = self.mas_penalty()
+        total_loss = ce_loss + self.mas_lambda * mas_loss
+        
+        total_loss.backward()
+        self.opt.step()
+        
+        return total_loss.item()
+    
+    def end_task(self, dataset):
+        MASMixin.end_task(self, dataset)
     
     @staticmethod
     def get_parser(parser):
-        """Add FastKAN-specific arguments"""
+        # MAS parameters
+        parser.add_argument('--mas_lambda', type=float, default=1.0,
+                          help='MAS regularization strength (recommended: 0.5-10, default: 1.0)')
+        
+        # KAN architecture parameters (MATCH baseline model!)
         parser.add_argument('--kan_hidden_dim', type=int, default=64,
                           help='Hidden dimension for KAN (default: 64)')
         parser.add_argument('--kan_num_grids', type=int, default=8,
@@ -105,4 +115,5 @@ class FrozenBackboneKANPretrained(FrozenBackbonePretrained):
                           help='Min value for grid range (default: -2.0)')
         parser.add_argument('--kan_grid_max', type=float, default=2.0,
                           help='Max value for grid range (default: 2.0)')
+        
         return parser
