@@ -1,6 +1,5 @@
 """
-Linear Classifier with MAS - Frozen Backbone (FIXED & TESTED)
-This version properly freezes the backbone and adds extensive debugging
+MLP Classifier with MAS - Frozen Backbone (FIXED & TESTED)
 """
 
 import torch
@@ -10,40 +9,32 @@ from datasets.utils.continual_dataset import ContinualDataset
 from argparse import Namespace
 
 
-class LinearMAS(ContinualModel, MASMixin):
-    """Linear classifier with MAS regularization and frozen backbone"""
-    NAME = 'frozen_backbone_linear_mas_pretrained'
+class MLPMAS(ContinualModel, MASMixin):
+    """MLP classifier with MAS regularization and frozen backbone"""
+    NAME = 'frozen_backbone_mlp_mas_pretrained'
     COMPATIBILITY = ['class-il', 'task-il']
     
     def __init__(self, backbone: torch.nn.Module, loss: torch.nn.Module,
                  args: Namespace, transform: torch.nn.Module, dataset: ContinualDataset):
         
-        # Initialize parent class
         super().__init__(backbone, loss, args, transform, dataset)
         
-        # CRITICAL: Freeze the backbone after initialization
         self._freeze_backbone()
         self._verify_frozen()
         self._print_trainable_summary()
         
-        # Initialize MAS attributes
         self.omega = {}
         self.old_params = {}
         self.task_count = 0
         
-        # Set MAS lambda
         self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 1.0
         
         print(f"\n{'='*70}")
-        print(f"[LinearMAS] MAS regularization enabled")
-        print(f"[LinearMAS] Lambda: {self.mas_lambda}")
+        print(f"[MLPMAS] MAS regularization enabled")
+        print(f"[MLPMAS] Lambda: {self.mas_lambda}")
         print(f"{'='*70}\n")
     
     def _freeze_backbone(self):
-        """
-        Freeze all backbone parameters.
-        Only the classifier should be trainable.
-        """
         print("\n" + "="*70)
         print("[FREEZE] Freezing backbone parameters...")
         print("="*70)
@@ -52,7 +43,6 @@ class LinearMAS(ContinualModel, MASMixin):
         trainable_count = 0
         
         for name, param in self.net.named_parameters():
-            # Freeze everything EXCEPT the classifier
             if 'classifier' not in name:
                 param.requires_grad = False
                 frozen_count += param.numel()
@@ -65,15 +55,11 @@ class LinearMAS(ContinualModel, MASMixin):
         print("="*70 + "\n")
     
     def _verify_frozen(self):
-        """
-        Verify that backbone is actually frozen.
-        Print warning if something is wrong.
-        """
         total = sum(p.numel() for p in self.net.parameters())
         trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
         frozen = total - trainable
         
-        expected_trainable = 5130  # Linear classifier: 512*10 + 10 = 5130
+        expected_trainable = 133898  # MLP: 512*256 + 256 + 256*10 + 10
         
         print("\n" + "="*70)
         print("[VERIFY] Checking freeze status...")
@@ -86,32 +72,22 @@ class LinearMAS(ContinualModel, MASMixin):
         
         if trainable > expected_trainable * 1.2:
             print(f"[VERIFY] ❌ ERROR: Too many trainable parameters!")
-            print(f"[VERIFY] ❌ Expected ~{expected_trainable:,}, got {trainable:,}")
-            print(f"[VERIFY] ❌ Backbone is NOT properly frozen!")
         else:
             print(f"[VERIFY] ✓ SUCCESS: Backbone is properly frozen")
-            print(f"[VERIFY] ✓ Only classifier is trainable")
         print("="*70 + "\n")
     
     def _print_trainable_summary(self):
-        """Print summary of trainable layers"""
         print("\n" + "="*70)
         print("[SUMMARY] Trainable Layers:")
         print("="*70)
         
-        trainable_layers = []
         for name, param in self.net.named_parameters():
             if param.requires_grad:
-                trainable_layers.append((name, param.numel()))
                 print(f"[SUMMARY]   ✓ {name}: {param.numel():,} params")
-        
-        if not trainable_layers:
-            print("[SUMMARY]   ❌ WARNING: No trainable layers found!")
         
         print("="*70 + "\n")
     
     def observe(self, inputs, labels, not_aug_inputs, epoch=None):
-        """Training step with MAS penalty"""
         self.opt.zero_grad()
         
         outputs = self.net(inputs)
@@ -125,7 +101,6 @@ class LinearMAS(ContinualModel, MASMixin):
         return total_loss.item()
     
     def end_task(self, dataset):
-        """Called at the end of each task"""
         MASMixin.end_task(self, dataset)
     
     @staticmethod
