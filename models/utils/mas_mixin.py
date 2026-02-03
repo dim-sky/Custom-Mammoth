@@ -1,6 +1,12 @@
 """
-MAS (Memory Aware Synapses) Mixin - PROPERLY SCALED VERSION
-Computes non-uniform Omega with CORRECT scaling for small classifiers
+MAS (Memory Aware Synapses) Mixin - PRODUCTION VERSION
+Following best practices from built-in EWC-ON
+
+Key improvements:
+1. Uses existing dataset.train_loader (no dataset.i modification)
+2. Normalizes by total dataset size (not sample count)
+3. Uses reasonable lambda values (1-10)
+4. Proper accumulation with decay (gamma parameter)
 """
 
 import torch
@@ -10,10 +16,8 @@ from typing import Dict
 
 class MASMixin:
     """
-    Mixin class for MAS functionality with proper scaling.
-    
-    KEY FIX: Omega is normalized to sum=1.0, not sum=num_params
-    This prevents penalty explosion with high lambda values.
+    Mixin class for MAS functionality.
+    Implements Memory Aware Synapses following EWC-ON best practices.
     """
     
     def __init__(self, *args, **kwargs):
@@ -21,16 +25,25 @@ class MASMixin:
         if hasattr(super(), '__init__'):
             super().__init__(*args, **kwargs)
     
-    def compute_omega(self, dataset, num_samples=200):
+    def compute_omega(self, dataset, num_samples=None):
         """
         Compute parameter importance (Omega) from output gradients.
-        CRITICAL FIX: Normalize Omega to sum=1.0 to prevent explosion
+        
+        Following EWC-ON approach:
+        1. Uses dataset.train_loader directly (no get_data_loaders())
+        2. Normalizes by total dataset size
+        3. Accumulates with decay (gamma)
+        
+        Args:
+            dataset: Current dataset object with train_loader
+            num_samples: If None, uses entire dataset. If int, uses that many samples.
         """
         print("\n" + "="*70)
         print(f"[MAS] Computing Omega for Task {self.task_count + 1}...")
         print("="*70)
         
-        # Initialize new omega for current task
+        # Initialize new omega (flattened vector like EWC-ON would do)
+        # But we'll keep dict structure for compatibility
         new_omega = {}
         for name, param in self.net.named_parameters():
             if param.requires_grad:
@@ -39,87 +52,113 @@ class MASMixin:
         # Set model to eval mode
         self.net.eval()
         
-        # Get data loader
+        # CRITICAL: Use existing train_loader (doesn't modify dataset.i)
+        if not hasattr(dataset, 'train_loader'):
+            print("[MAS] ERROR: dataset has no train_loader!")
+            print("[MAS] Falling back to uniform Omega")
+            self._fallback_uniform_omega(new_omega)
+            return
+        
+        train_loader = dataset.train_loader
+        batch_size = dataset.get_batch_size()
+        
+        # Determine how many samples to process
+        if num_samples is None:
+            # Use entire dataset
+            max_batches = len(train_loader)
+            total_samples = len(train_loader) * batch_size
+            print(f"[MAS] Computing importance from entire dataset ({total_samples} samples)...")
+        else:
+            # Use specified number of samples
+            max_batches = max(1, num_samples // batch_size)
+            total_samples = max_batches * batch_size
+            print(f"[MAS] Computing importance from {total_samples} samples...")
+        
+        samples_processed = 0
+        
         try:
-            train_loader, _ = dataset.get_data_loaders()
+            for batch_idx, batch_data in enumerate(train_loader):
+                if batch_idx >= max_batches:
+                    break
+                
+                # Unpack batch
+                if isinstance(batch_data, (list, tuple)):
+                    inputs = batch_data[0]
+                    # Prefer not_aug_inputs if available
+                    if len(batch_data) > 2 and batch_data[2] is not None:
+                        inputs = batch_data[2]
+                else:
+                    inputs = batch_data
+                
+                inputs = inputs.to(self.device)
+                current_batch_size = inputs.size(0)
+                
+                # Process each sample in batch individually
+                for i in range(current_batch_size):
+                    self.net.zero_grad()
+                    
+                    # Forward pass for single sample
+                    single_input = inputs[i:i+1]
+                    output = self.net(single_input)
+                    
+                    # Compute L2 norm of output (like MAS paper)
+                    output_norm = output.pow(2).sum()
+                    
+                    # Backward to get gradients
+                    output_norm.backward()
+                    
+                    # Accumulate absolute gradients as importance
+                    for name, param in self.net.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            new_omega[name] += param.grad.abs().detach()
+                    
+                    samples_processed += 1
+                
+                # Progress update every 10 batches
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"[MAS] Processed {samples_processed} samples...")
+        
         except Exception as e:
-            print(f"[MAS] WARNING: Could not get data loader: {e}")
+            print(f"[MAS] ERROR during Omega computation: {e}")
             print(f"[MAS] Falling back to uniform Omega")
             self._fallback_uniform_omega(new_omega)
             return
         
-        # Compute importance from gradients
-        print(f"[MAS] Computing importance from {num_samples} samples...")
-        samples_processed = 0
-        max_batches = max(1, num_samples // dataset.get_batch_size())
-        
-        for batch_idx, batch_data in enumerate(train_loader):
-            if batch_idx >= max_batches:
-                break
-            
-            # Unpack batch
-            if isinstance(batch_data, (list, tuple)):
-                inputs = batch_data[0]
-                if len(batch_data) > 2:
-                    inputs = batch_data[2]
-            else:
-                inputs = batch_data
-            
-            inputs = inputs.to(self.device)
-            batch_size = inputs.size(0)
-            
-            # Process samples
-            for i in range(min(batch_size, num_samples - samples_processed)):
-                self.net.zero_grad()
-                
-                single_input = inputs[i:i+1]
-                output = self.net(single_input)
-                
-                # L2 norm of output
-                output_norm = output.pow(2).sum()
-                output_norm.backward()
-                
-                # Accumulate absolute gradients
-                for name, param in self.net.named_parameters():
-                    if param.requires_grad and param.grad is not None:
-                        new_omega[name] += param.grad.abs().detach()
-                
-                samples_processed += 1
-            
-            if samples_processed >= num_samples:
-                break
-        
         print(f"[MAS] ✓ Processed {samples_processed} samples")
         
-        # Normalize by number of samples
+        # CRITICAL: Normalize by TOTAL DATASET SIZE (like EWC-ON)
+        # This keeps omega values small and prevents explosion
+        total_dataset_size = len(train_loader) * batch_size
+        
         if samples_processed > 0:
             for name in new_omega:
+                # Divide by samples processed to get average
                 new_omega[name] /= samples_processed
+                
+                # Scale to represent full dataset
+                # This makes omega comparable across different sample sizes
+                new_omega[name] *= (samples_processed / total_dataset_size)
         
-        # CRITICAL FIX: Normalize omega to sum=1.0 (not sum=num_params!)
-        current_sum = sum(o.sum().item() for o in new_omega.values())
+        print(f"[MAS] Normalized by dataset size: {total_dataset_size}")
         
-        if current_sum > 0:
-            # Scale so total Omega = 1.0
-            scale_factor = 1.0 / current_sum
-            for name in new_omega:
-                new_omega[name] *= scale_factor
-            
-            print(f"[MAS] Normalized Omega (sum: {current_sum:.2f} → 1.0)")
-        
-        # Accumulate omega across tasks
+        # Accumulate omega with decay (like EWC-ON with gamma)
         if not self.omega:
+            # First task - initialize
             self.omega = new_omega
             print(f"[MAS] ✓ Initialized Omega (Task 1)")
         else:
-            alpha = 1.0 / (self.task_count + 1)
-            print(f"[MAS] Accumulating Omega (alpha={alpha:.4f})...")
+            # Subsequent tasks - accumulate with decay
+            gamma = 0.9  # Decay factor (like EWC-ON)
+            
+            print(f"[MAS] Accumulating Omega with decay (gamma={gamma})...")
             for name in self.omega:
                 if name in new_omega:
-                    self.omega[name] = (1 - alpha) * self.omega[name] + alpha * new_omega[name]
+                    # Decay old importance, add new importance
+                    self.omega[name] = gamma * self.omega[name] + new_omega[name]
+            
             print(f"[MAS] ✓ Accumulated Omega (Task {self.task_count + 1})")
         
-        # Store optimal parameters
+        # Store optimal parameters from current task
         self.old_params = {}
         for name, param in self.net.named_parameters():
             if param.requires_grad:
@@ -133,13 +172,17 @@ class MASMixin:
         
         # Set model back to train mode
         self.net.train()
+        
+        print("="*70 + "\n")
     
     def _fallback_uniform_omega(self, new_omega):
-        """Fallback to uniform omega"""
+        """Fallback to uniform omega if gradient computation fails"""
         print("[MAS] Using uniform Omega as fallback...")
         
         total_params = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
-        base_omega = 1.0 / total_params  # Normalize to sum=1.0
+        
+        # Small uniform value (like normalized gradient would be)
+        base_omega = 0.001 / total_params
         
         for name, param in self.net.named_parameters():
             if param.requires_grad:
@@ -148,9 +191,9 @@ class MASMixin:
         if not self.omega:
             self.omega = new_omega
         else:
-            alpha = 1.0 / (self.task_count + 1)
+            gamma = 0.9
             for name in self.omega:
-                self.omega[name] = (1 - alpha) * self.omega[name] + alpha * new_omega[name]
+                self.omega[name] = gamma * self.omega[name] + new_omega[name]
         
         self.old_params = {}
         for name, param in self.net.named_parameters():
@@ -161,21 +204,26 @@ class MASMixin:
         self._print_omega_stats()
     
     def _print_omega_stats(self):
-        """Print statistics"""
-        print("\n" + "="*70)
+        """Print detailed statistics about Omega values"""
+        print("\n" + "-"*70)
         print("[MAS] Omega Statistics:")
-        print("="*70)
+        print("-"*70)
         
+        # Overall stats
         total_omega = sum(o.sum().item() for o in self.omega.values())
         total_elements = sum(o.numel() for o in self.omega.values())
         avg_omega = total_omega / total_elements if total_elements > 0 else 0
+        min_omega = min(o.min().item() for o in self.omega.values())
+        max_omega = max(o.max().item() for o in self.omega.values())
         
         print(f"[MAS]   Total Omega sum: {total_omega:.6f}")
-        print(f"[MAS]   Average Omega: {avg_omega:.10f}")
+        print(f"[MAS]   Average Omega: {avg_omega:.8f}")
+        print(f"[MAS]   Min Omega: {min_omega:.8f}")
+        print(f"[MAS]   Max Omega: {max_omega:.6f}")
         print(f"[MAS]   Protected parameters: {total_elements:,}")
         print(f"[MAS]   Tasks accumulated: {self.task_count}")
         
-        # Per-layer stats
+        # Per-layer stats (top 2 for brevity)
         layer_importance = []
         for name, omega in self.omega.items():
             layer_sum = omega.sum().item()
@@ -183,36 +231,49 @@ class MASMixin:
             layer_max = omega.max().item()
             layer_importance.append((name, layer_sum, layer_avg, layer_max))
         
+        # Sort by total importance
         layer_importance.sort(key=lambda x: x[1], reverse=True)
         
-        print(f"\n[MAS]   Top Important Layers:")
-        for i, (name, total, avg, max_val) in enumerate(layer_importance[:5]):
-            print(f"[MAS]     {i+1}. {name}")
-            print(f"[MAS]        Sum: {total:.6f}, Avg: {avg:.10f}, Max: {max_val:.6f}")
+        if layer_importance:
+            print(f"\n[MAS]   Most Important Layers:")
+            for i, (name, total, avg, max_val) in enumerate(layer_importance[:2]):
+                print(f"[MAS]     {i+1}. {name}")
+                print(f"[MAS]        Sum: {total:.6f}, Avg: {avg:.8f}, Max: {max_val:.6f}")
         
-        print("="*70 + "\n")
+        print("-"*70)
     
     def mas_penalty(self):
         """
-        Compute MAS penalty.
-        With normalized Omega (sum=1.0), lambda can be higher (10-100)
+        Compute MAS penalty term.
+        
+        With proper normalization, lambda values of 1-10 work well.
         """
         if not self.omega or not self.old_params:
             return torch.tensor(0.0).to(self.device)
         
         penalty = torch.tensor(0.0).to(self.device)
         
+        # Compute penalty for each parameter
         for name, param in self.net.named_parameters():
             if name in self.omega and name in self.old_params:
+                # Squared difference from optimal values
                 diff = (param - self.old_params[name]).pow(2)
-                penalty += (self.omega[name] * diff).sum()
+                
+                # Weight by importance (Omega)
+                weighted_diff = self.omega[name] * diff
+                penalty += weighted_diff.sum()
         
-        # NO division by task_count
-        # Safety clip (higher max because Omega is normalized)
-        penalty = torch.clamp(penalty, max=1000.0)
+        # Safety clip to prevent numerical issues
+        # With proper normalization, this should rarely trigger
+        penalty = torch.clamp(penalty, max=10000.0)
         
         return penalty
     
     def end_task(self, dataset):
-        """Called at end of each task"""
-        self.compute_omega(dataset, num_samples=200)
+        """
+        Called at the end of each task.
+        Computes Omega (parameter importance) from gradients.
+        """
+        # Compute omega using first 1000 samples (or entire dataset if smaller)
+        # This is a good balance between speed and accuracy
+        self.compute_omega(dataset, num_samples=1000)

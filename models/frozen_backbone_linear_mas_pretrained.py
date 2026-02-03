@@ -1,6 +1,6 @@
 """
 Linear Classifier with MAS - Frozen Backbone
-Uses proper gradient-based Omega computation with higher lambda
+Uses proper MAS implementation following EWC-ON best practices
 """
 
 import torch
@@ -28,13 +28,13 @@ class LinearMAS(ContinualModel, MASMixin):
         self.old_params = {}
         self.task_count = 0
         
-        # INCREASED default lambda for gradient-based MAS
-        self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 100.0
+        # CORRECTED: Lower default lambda (1-10, not 100-1000)
+        self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 1.0
         
         print(f"\n{'='*70}")
-        print(f"[LinearMAS] MAS regularization enabled (Gradient-based)")
+        print(f"[LinearMAS] MAS regularization enabled")
         print(f"[LinearMAS] Lambda: {self.mas_lambda}")
-        print(f"[LinearMAS] NOTE: Using higher lambda (10-1000) for proper regularization")
+        print(f"[LinearMAS] Recommended lambda range: 0.5 - 10.0")
         print(f"{'='*70}\n")
     
     def _freeze_backbone(self):
@@ -75,8 +75,10 @@ class LinearMAS(ContinualModel, MASMixin):
         
         if trainable > expected_trainable * 1.2:
             print(f"[VERIFY] ❌ ERROR: Too many trainable parameters!")
+            print(f"[VERIFY] ❌ Backbone is NOT properly frozen!")
         else:
             print(f"[VERIFY] ✓ SUCCESS: Backbone is properly frozen")
+            print(f"[VERIFY] ✓ Only classifier is trainable")
         print("="*70 + "\n")
     
     def _print_trainable_summary(self):
@@ -110,6 +112,6 @@ class LinearMAS(ContinualModel, MASMixin):
     
     @staticmethod
     def get_parser(parser):
-        parser.add_argument('--mas_lambda', type=float, default=100.0,
-                          help='MAS regularization strength (recommended: 10-1000, default: 100)')
+        parser.add_argument('--mas_lambda', type=float, default=1.0,
+                          help='MAS regularization strength (recommended: 0.5-10, default: 1.0)')
         return parser
