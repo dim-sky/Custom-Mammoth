@@ -1,7 +1,7 @@
 """
-MAS (Memory Aware Synapses) Mixin - CORRECTED VERSION
-This version properly handles frozen backbones by counting
-ONLY trainable parameters, not the entire network.
+MAS (Memory Aware Synapses) Mixin - PROPER IMPLEMENTATION
+Computes non-uniform Omega based on output sensitivity (gradients)
+Accumulates importance across tasks without task_count division
 """
 
 import torch
@@ -11,82 +11,147 @@ from typing import Dict
 
 class MASMixin:
     """
-    Mixin class that adds MAS (Memory Aware Synapses) functionality
-    to continual learning models.
+    Mixin class for MAS functionality with proper importance computation.
     
-    MAS works by:
-    1. Measuring parameter importance (Omega) after each task
-    2. Adding a penalty when parameters change too much in future tasks
-    3. This prevents catastrophic forgetting
+    Key improvements:
+    1. Computes Omega from gradients (output sensitivity) - NOT uniform
+    2. Accumulates Omega across tasks (weighted averaging)
+    3. No penalty division by task_count (let it grow naturally)
+    4. Designed for higher lambda values (10-1000)
     """
     
     def __init__(self, *args, **kwargs):
-        """
-        Initialize MAS attributes.
-        
-        Note: This mixin is designed to work with multiple inheritance.
-        We accept *args and **kwargs to pass them to other parent classes.
-        """
+        """Initialize MAS attributes"""
         if hasattr(super(), '__init__'):
             super().__init__(*args, **kwargs)
     
     def compute_omega(self, dataset, num_samples=200):
         """
-        Compute parameter importance (Omega).
+        Compute parameter importance (Omega) from output gradients.
         
-        This method calculates how "important" each parameter is.
-        In this simplified version, we use uniform importance
-        (all parameters equally important).
+        This method measures how much each parameter affects the output.
+        Parameters that have large gradients are considered more important.
         
-        CRITICAL FIX: We only count TRAINABLE parameters,
-        not the frozen backbone. This prevents the Omega values
-        from being too small.
+        Algorithm:
+        1. Sample data from current task
+        2. Forward pass to get outputs
+        3. Compute L2 norm of outputs
+        4. Backpropagate to get gradients
+        5. Omega = absolute value of gradients (importance)
+        6. Accumulate across tasks with weighted averaging
         """
         print("\n" + "="*70)
         print(f"[MAS] Computing Omega for Task {self.task_count + 1}...")
         print("="*70)
         
-        # Only initialize Omega once (first task)
+        # Initialize new omega for current task
+        new_omega = {}
+        for name, param in self.net.named_parameters():
+            if param.requires_grad:
+                new_omega[name] = torch.zeros_like(param)
+        
+        # Set model to eval mode (no dropout, batchnorm in eval)
+        self.net.eval()
+        
+        # Get data loader for current task
+        try:
+            train_loader, _ = dataset.get_data_loaders()
+        except Exception as e:
+            print(f"[MAS] WARNING: Could not get data loader: {e}")
+            print(f"[MAS] Falling back to uniform Omega")
+            self._fallback_uniform_omega(new_omega)
+            return
+        
+        # Compute importance from gradients
+        print(f"[MAS] Computing importance from {num_samples} samples...")
+        samples_processed = 0
+        max_batches = max(1, num_samples // dataset.get_batch_size())
+        
+        for batch_idx, batch_data in enumerate(train_loader):
+            if batch_idx >= max_batches:
+                break
+            
+            # Unpack batch (we only need inputs, not labels)
+            if isinstance(batch_data, (list, tuple)):
+                inputs = batch_data[0]
+                if len(batch_data) > 2:
+                    inputs = batch_data[2]  # not_aug_inputs if available
+            else:
+                inputs = batch_data
+            
+            inputs = inputs.to(self.device)
+            batch_size = inputs.size(0)
+            
+            # Process each sample individually to get per-sample gradients
+            for i in range(batch_size):
+                if samples_processed >= num_samples:
+                    break
+                
+                # Zero gradients
+                self.net.zero_grad()
+                
+                # Forward pass for single sample
+                single_input = inputs[i:i+1]
+                output = self.net(single_input)
+                
+                # Compute L2 norm of output (measure of output magnitude)
+                # This is what we want to preserve - the output pattern
+                output_norm = output.pow(2).sum()
+                
+                # Backward pass - compute how each parameter affects output
+                output_norm.backward()
+                
+                # Accumulate absolute gradients (importance)
+                for name, param in self.net.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        # Use absolute value of gradient as importance measure
+                        new_omega[name] += param.grad.abs().detach()
+                
+                samples_processed += 1
+            
+            if samples_processed >= num_samples:
+                break
+            
+            # Progress update
+            if (batch_idx + 1) % 5 == 0:
+                print(f"[MAS] Processed {samples_processed}/{num_samples} samples...")
+        
+        print(f"[MAS] ✓ Processed {samples_processed} samples")
+        
+        # Normalize by number of samples
+        if samples_processed > 0:
+            for name in new_omega:
+                new_omega[name] /= samples_processed
+        
+        # Accumulate omega across tasks (online EWC-style)
         if not self.omega:
-            # Count ONLY parameters that can actually change (trainable)
-            trainable_params = [p for p in self.net.parameters() if p.requires_grad]
-            total_params = sum(p.numel() for p in trainable_params)
-            
-            print(f"[MAS] Counting trainable parameters...")
-            print(f"[MAS] Total trainable parameters: {total_params:,}")
-            
-            # Safety check
-            if total_params == 0:
-                print("[MAS] ❌ ERROR: No trainable parameters found!")
-                print("[MAS] ❌ Cannot compute Omega. Model is fully frozen!")
-                return
-            
-            # Calculate base importance value
-            # We normalize by total params so the sum equals 1.0
-            base_omega = 1.0 / total_params
-            
-            print(f"[MAS] Base Omega value per parameter: {base_omega:.10f}")
-            print(f"[MAS] (This should be ~0.0002 for Linear, ~0.000007 for MLP)")
-            
-            # Create Omega dictionary
-            # Each trainable parameter gets the same base importance
-            self.omega = {}
-            omega_count = 0
-            for name, param in self.net.named_parameters():
-                if param.requires_grad:
-                    # All parameters get uniform importance
-                    self.omega[name] = torch.ones_like(param) * base_omega
-                    omega_count += param.numel()
-            
-            print(f"[MAS] ✓ Created Omega for {omega_count:,} parameters")
+            # First task - just use computed omega
+            self.omega = new_omega
             print(f"[MAS] ✓ Initialized Omega (Task 1)")
         else:
-            # For subsequent tasks, keep using the same Omega
-            # (In this simplified version, we don't recompute)
-            print(f"[MAS] ✓ Using existing Omega (Task {self.task_count + 1})")
+            # Subsequent tasks - weighted average with previous omega
+            # This accumulates importance: important for multiple tasks = very important
+            alpha = 1.0 / (self.task_count + 1)  # Weight for new task
+            
+            print(f"[MAS] Accumulating Omega (alpha={alpha:.4f})...")
+            for name in self.omega:
+                if name in new_omega:
+                    # Weighted average: old importance + new importance
+                    self.omega[name] = (1 - alpha) * self.omega[name] + alpha * new_omega[name]
+            
+            print(f"[MAS] ✓ Accumulated Omega (Task {self.task_count + 1})")
         
-        # Save the current parameter values
-        # These will be the "target" values that we try to stay close to
+        # Normalize omega to prevent explosion
+        # Scale so that sum = number of parameters (not 1.0)
+        total_params = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+        current_sum = sum(o.sum().item() for o in self.omega.values())
+        
+        if current_sum > 0:
+            scale_factor = total_params / current_sum
+            for name in self.omega:
+                self.omega[name] *= scale_factor
+        
+        # Store optimal parameters from current task
         self.old_params = {}
         for name, param in self.net.named_parameters():
             if param.requires_grad:
@@ -95,63 +160,110 @@ class MASMixin:
         # Increment task counter
         self.task_count += 1
         
-        # Print statistics for debugging
-        total_omega = sum(o.sum().item() for o in self.omega.values())
-        avg_omega = total_omega / sum(o.numel() for o in self.omega.values())
+        # Print statistics
+        self._print_omega_stats()
         
-        print(f"\n[MAS] Omega Statistics:")
-        print(f"[MAS]   Total Omega sum: {total_omega:.6f}")
-        print(f"[MAS]   Average Omega per parameter: {avg_omega:.10f}")
-        print(f"[MAS]   Number of protected parameters: {sum(o.numel() for o in self.omega.values()):,}")
-        print(f"[MAS]   Tasks completed: {self.task_count}")
+        # Set model back to train mode
+        self.net.train()
+    
+    def _fallback_uniform_omega(self, new_omega):
+        """Fallback to uniform omega if gradient computation fails"""
+        print("[MAS] Using uniform Omega as fallback...")
+        
+        total_params = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
+        base_omega = 1.0
+        
+        for name, param in self.net.named_parameters():
+            if param.requires_grad:
+                new_omega[name] = torch.ones_like(param) * base_omega
+        
+        if not self.omega:
+            self.omega = new_omega
+        else:
+            alpha = 1.0 / (self.task_count + 1)
+            for name in self.omega:
+                self.omega[name] = (1 - alpha) * self.omega[name] + alpha * new_omega[name]
+        
+        self.old_params = {}
+        for name, param in self.net.named_parameters():
+            if param.requires_grad:
+                self.old_params[name] = param.data.clone()
+        
+        self.task_count += 1
+        self._print_omega_stats()
+    
+    def _print_omega_stats(self):
+        """Print detailed statistics about Omega values"""
+        print("\n" + "="*70)
+        print("[MAS] Omega Statistics:")
+        print("="*70)
+        
+        # Overall stats
+        total_omega = sum(o.sum().item() for o in self.omega.values())
+        total_elements = sum(o.numel() for o in self.omega.values())
+        avg_omega = total_omega / total_elements if total_elements > 0 else 0
+        
+        print(f"[MAS]   Total Omega sum: {total_omega:.2f}")
+        print(f"[MAS]   Average Omega: {avg_omega:.6f}")
+        print(f"[MAS]   Protected parameters: {total_elements:,}")
+        print(f"[MAS]   Tasks accumulated: {self.task_count}")
+        
+        # Per-layer stats (top 5 most important)
+        layer_importance = []
+        for name, omega in self.omega.items():
+            layer_sum = omega.sum().item()
+            layer_avg = omega.mean().item()
+            layer_max = omega.max().item()
+            layer_importance.append((name, layer_sum, layer_avg, layer_max))
+        
+        # Sort by total importance
+        layer_importance.sort(key=lambda x: x[1], reverse=True)
+        
+        print(f"\n[MAS]   Top 5 Most Important Layers:")
+        for i, (name, total, avg, max_val) in enumerate(layer_importance[:5]):
+            print(f"[MAS]     {i+1}. {name}")
+            print(f"[MAS]        Total: {total:.4f}, Avg: {avg:.6f}, Max: {max_val:.6f}")
+        
         print("="*70 + "\n")
     
     def mas_penalty(self):
         """
-        Calculate the MAS penalty (regularization term).
+        Compute MAS penalty term.
         
-        This penalty measures how much the parameters have changed
-        from their "optimal" values after the previous task.
+        CRITICAL CHANGES:
+        1. NO division by task_count (let penalty grow with tasks)
+        2. Uses accumulated Omega (grows with importance)
+        3. Designed for higher lambda values (10-1000)
         
-        Formula: penalty = Σ Omega[i] × (current_param[i] - old_param[i])²
-        
-        The penalty is:
-        - Zero if parameters haven't changed
-        - Large if important parameters have changed a lot
+        Formula: penalty = λ × Σ Omega[i] × (current[i] - old[i])²
         """
-        # If we haven't computed Omega yet, no penalty
         if not self.omega or not self.old_params:
             return torch.tensor(0.0).to(self.device)
         
         penalty = torch.tensor(0.0).to(self.device)
         
-        # For each trainable parameter
+        # Compute penalty for each parameter
         for name, param in self.net.named_parameters():
             if name in self.omega and name in self.old_params:
-                # Calculate how much it changed (squared difference)
+                # Squared difference from optimal values
                 diff = (param - self.old_params[name]).pow(2)
                 
-                # Weight the change by importance (Omega)
-                # Important parameters get penalized more for changing
-                penalty += (self.omega[name] * diff).sum()
+                # Weight by importance (Omega)
+                weighted_diff = self.omega[name] * diff
+                penalty += weighted_diff.sum()
         
-        # Divide by number of tasks to prevent linear growth
-        # This keeps the penalty magnitude consistent as we learn more tasks
-        if self.task_count > 0:
-            penalty = penalty / self.task_count
+        # NO division by task_count - let it grow!
+        # This is intentional - accumulated importance × accumulated changes
         
-        # Safety: clip penalty to prevent extreme values
-        # This prevents numerical instability
-        penalty = torch.clamp(penalty, max=100.0)
+        # Safety clip to prevent numerical overflow
+        # Higher max because we expect larger penalties now
+        penalty = torch.clamp(penalty, max=10000.0)
         
         return penalty
     
     def end_task(self, dataset):
         """
         Called at the end of each task.
-        
-        This method computes the Omega (importance) values
-        based on the current task, then saves the current
-        parameter values as the "optimal" values to protect.
+        Computes Omega (parameter importance) from gradients.
         """
         self.compute_omega(dataset, num_samples=200)

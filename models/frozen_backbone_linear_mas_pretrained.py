@@ -1,6 +1,6 @@
 """
-Linear Classifier with MAS - Frozen Backbone (FIXED & TESTED)
-This version properly freezes the backbone and adds extensive debugging
+Linear Classifier with MAS - Frozen Backbone
+Uses proper gradient-based Omega computation with higher lambda
 """
 
 import torch
@@ -18,32 +18,26 @@ class LinearMAS(ContinualModel, MASMixin):
     def __init__(self, backbone: torch.nn.Module, loss: torch.nn.Module,
                  args: Namespace, transform: torch.nn.Module, dataset: ContinualDataset):
         
-        # Initialize parent class
         super().__init__(backbone, loss, args, transform, dataset)
         
-        # CRITICAL: Freeze the backbone after initialization
         self._freeze_backbone()
         self._verify_frozen()
         self._print_trainable_summary()
         
-        # Initialize MAS attributes
         self.omega = {}
         self.old_params = {}
         self.task_count = 0
         
-        # Set MAS lambda
-        self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 1.0
+        # INCREASED default lambda for gradient-based MAS
+        self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 100.0
         
         print(f"\n{'='*70}")
-        print(f"[LinearMAS] MAS regularization enabled")
+        print(f"[LinearMAS] MAS regularization enabled (Gradient-based)")
         print(f"[LinearMAS] Lambda: {self.mas_lambda}")
+        print(f"[LinearMAS] NOTE: Using higher lambda (10-1000) for proper regularization")
         print(f"{'='*70}\n")
     
     def _freeze_backbone(self):
-        """
-        Freeze all backbone parameters.
-        Only the classifier should be trainable.
-        """
         print("\n" + "="*70)
         print("[FREEZE] Freezing backbone parameters...")
         print("="*70)
@@ -52,7 +46,6 @@ class LinearMAS(ContinualModel, MASMixin):
         trainable_count = 0
         
         for name, param in self.net.named_parameters():
-            # Freeze everything EXCEPT the classifier
             if 'classifier' not in name:
                 param.requires_grad = False
                 frozen_count += param.numel()
@@ -65,15 +58,11 @@ class LinearMAS(ContinualModel, MASMixin):
         print("="*70 + "\n")
     
     def _verify_frozen(self):
-        """
-        Verify that backbone is actually frozen.
-        Print warning if something is wrong.
-        """
         total = sum(p.numel() for p in self.net.parameters())
         trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
         frozen = total - trainable
         
-        expected_trainable = 5130  # Linear classifier: 512*10 + 10 = 5130
+        expected_trainable = 5130
         
         print("\n" + "="*70)
         print("[VERIFY] Checking freeze status...")
@@ -86,27 +75,18 @@ class LinearMAS(ContinualModel, MASMixin):
         
         if trainable > expected_trainable * 1.2:
             print(f"[VERIFY] ❌ ERROR: Too many trainable parameters!")
-            print(f"[VERIFY] ❌ Expected ~{expected_trainable:,}, got {trainable:,}")
-            print(f"[VERIFY] ❌ Backbone is NOT properly frozen!")
         else:
             print(f"[VERIFY] ✓ SUCCESS: Backbone is properly frozen")
-            print(f"[VERIFY] ✓ Only classifier is trainable")
         print("="*70 + "\n")
     
     def _print_trainable_summary(self):
-        """Print summary of trainable layers"""
         print("\n" + "="*70)
         print("[SUMMARY] Trainable Layers:")
         print("="*70)
         
-        trainable_layers = []
         for name, param in self.net.named_parameters():
             if param.requires_grad:
-                trainable_layers.append((name, param.numel()))
                 print(f"[SUMMARY]   ✓ {name}: {param.numel():,} params")
-        
-        if not trainable_layers:
-            print("[SUMMARY]   ❌ WARNING: No trainable layers found!")
         
         print("="*70 + "\n")
     
@@ -130,6 +110,6 @@ class LinearMAS(ContinualModel, MASMixin):
     
     @staticmethod
     def get_parser(parser):
-        parser.add_argument('--mas_lambda', type=float, default=1.0,
-                          help='MAS regularization strength (default: 1.0)')
+        parser.add_argument('--mas_lambda', type=float, default=100.0,
+                          help='MAS regularization strength (recommended: 10-1000, default: 100)')
         return parser
