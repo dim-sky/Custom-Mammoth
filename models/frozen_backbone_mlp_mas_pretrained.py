@@ -105,6 +105,14 @@ class MLPMAS(ContinualModel, MASMixin):
     
     @staticmethod
     def get_parser(parser):
+        # MAS parameters
         parser.add_argument('--mas_lambda', type=float, default=1.0,
                           help='MAS regularization strength (recommended: 0.5-10, default: 1.0)')
+        
+        # MLP architecture parameters (ADDED!)
+        parser.add_argument('--mlp_hidden_dim', type=int, default=256,
+                          help='Hidden dimension for MLP classifier (default: 256)')
+        parser.add_argument('--mlp_dropout', type=float, default=0.5,
+                          help='Dropout rate for MLP classifier (default: 0.5)')
+        
         return parser
