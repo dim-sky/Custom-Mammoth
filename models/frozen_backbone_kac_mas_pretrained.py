@@ -1,6 +1,5 @@
 """
-Linear Classifier with MAS - Frozen Backbone
-Uses proper MAS implementation following EWC-ON best practices
+KAC Classifier with MAS - Frozen Backbone
 """
 
 import torch
@@ -10,9 +9,9 @@ from datasets.utils.continual_dataset import ContinualDataset
 from argparse import Namespace
 
 
-class LinearMAS(ContinualModel, MASMixin):
-    """Linear classifier with MAS regularization and frozen backbone"""
-    NAME = 'frozen_backbone_linear_mas_pretrained'
+class KACMAS(ContinualModel, MASMixin):
+    """KAC classifier with MAS regularization and frozen backbone"""
+    NAME = 'frozen_backbone_kac_mas_pretrained'
     COMPATIBILITY = ['class-il', 'task-il']
     
     def __init__(self, backbone: torch.nn.Module, loss: torch.nn.Module,
@@ -28,13 +27,11 @@ class LinearMAS(ContinualModel, MASMixin):
         self.old_params = {}
         self.task_count = 0
         
-        # CORRECTED: Lower default lambda (1-10, not 100-1000)
         self.mas_lambda = args.mas_lambda if hasattr(args, 'mas_lambda') else 1.0
         
         print(f"\n{'='*70}")
-        print(f"[LinearMAS] MAS regularization enabled")
-        print(f"[LinearMAS] Lambda: {self.mas_lambda}")
-        print(f"[LinearMAS] Recommended lambda range: 0.5 - 10.0")
+        print(f"[KACMAS] MAS regularization enabled")
+        print(f"[KACMAS] Lambda: {self.mas_lambda}")
         print(f"{'='*70}\n")
     
     def _freeze_backbone(self):
@@ -62,23 +59,18 @@ class LinearMAS(ContinualModel, MASMixin):
         trainable = sum(p.numel() for p in self.net.parameters() if p.requires_grad)
         frozen = total - trainable
         
-        expected_trainable = 5130
-        
         print("\n" + "="*70)
         print("[VERIFY] Checking freeze status...")
         print("="*70)
         print(f"[VERIFY] Total parameters: {total:,}")
         print(f"[VERIFY] Trainable parameters: {trainable:,}")
         print(f"[VERIFY] Frozen parameters: {frozen:,}")
-        print(f"[VERIFY] Expected trainable: ~{expected_trainable:,}")
         print(f"[VERIFY] Percentage frozen: {100 * frozen / total:.2f}%")
         
-        if trainable > expected_trainable * 1.2:
+        if trainable > 100000:
             print(f"[VERIFY] ❌ ERROR: Too many trainable parameters!")
-            print(f"[VERIFY] ❌ Backbone is NOT properly frozen!")
         else:
             print(f"[VERIFY] ✓ SUCCESS: Backbone is properly frozen")
-            print(f"[VERIFY] ✓ Only classifier is trainable")
         print("="*70 + "\n")
     
     def _print_trainable_summary(self):
@@ -93,7 +85,6 @@ class LinearMAS(ContinualModel, MASMixin):
         print("="*70 + "\n")
     
     def observe(self, inputs, labels, not_aug_inputs, epoch=None):
-        """Training step with MAS penalty"""
         self.opt.zero_grad()
         
         outputs = self.net(inputs)
@@ -107,7 +98,6 @@ class LinearMAS(ContinualModel, MASMixin):
         return total_loss.item()
     
     def end_task(self, dataset):
-        """Called at the end of each task"""
         MASMixin.end_task(self, dataset)
     
     @staticmethod
