@@ -43,6 +43,10 @@ class SequentialTinyImagenet224(SequentialTinyImagenet):
         transforms.Normalize(MEAN, STD),
     ])
 
+
+    print(">>> USING DATASET: seq-tinyimg-224")
+    print(">>> TEST_TRANSFORM:", TEST_TRANSFORM)
+
     @set_default_from_args('n_epochs')
     def get_epochs(self):
         # Default number of epochs for TinyImageNet
