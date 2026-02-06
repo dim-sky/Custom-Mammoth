@@ -15,7 +15,7 @@ class FrozenBackboneKANLwF(FrozenBackboneKANPretrained):
     COMPATIBILITY = ['class-il', 'task-il']
     
     def __init__(self, backbone, loss, args, transform, dataset):
-        # Call KAN parent to get KAN classifier
+        # Call base parent
         super().__init__(backbone, loss, args, transform, dataset)
         
         # Add LwF-specific attributes
@@ -25,6 +25,7 @@ class FrozenBackboneKANLwF(FrozenBackboneKANPretrained):
         print(f"\n{'='*70}")
         print(f"[LwF-KAN] Learning without Forgetting enabled")
         print(f"[LwF-KAN] Classifier type: {type(self.net.classifier)}")
+        print(f"[LwF-KAN] Model NAME: {self.NAME}")
         print(f"{'='*70}\n")
     
     def observe(self, inputs, labels, not_aug_inputs, epoch=None):
@@ -67,3 +68,12 @@ class FrozenBackboneKANLwF(FrozenBackboneKANPretrained):
         for param in self.old_net.parameters():
             param.requires_grad = False
         self.net.train()
+    
+    @staticmethod
+    def get_parser(parser):
+        parser = FrozenBackbonePretrained.get_parser(parser)
+        parser.add_argument('--kan_hidden_dim', type=int, default=64)
+        parser.add_argument('--kan_num_grids', type=int, default=8)
+        parser.add_argument('--kan_grid_min', type=float, default=-2.0)
+        parser.add_argument('--kan_grid_max', type=float, default=2.0)
+        return parser
