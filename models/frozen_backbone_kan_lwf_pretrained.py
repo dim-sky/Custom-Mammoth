@@ -71,7 +71,7 @@ class FrozenBackboneKANLwF(FrozenBackboneKANPretrained):
     
     @staticmethod
     def get_parser(parser):
-        parser = FrozenBackbonePretrained.get_parser(parser)
+        parser = FrozenBackboneKANPretrained.get_parser(parser)
         parser.add_argument('--kan_hidden_dim', type=int, default=64)
         parser.add_argument('--kan_num_grids', type=int, default=8)
         parser.add_argument('--kan_grid_min', type=float, default=-2.0)
